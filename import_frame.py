@@ -273,7 +273,15 @@ def reconstruct(objs, frame_dir):
     ref_diag = Vector(bpy.data.objects[ref].dimensions).length or 1.0
     keep_radius = RECON_KEEP_FACTOR * ref_diag
 
-    kept, removed = [], 0
+    def _vc(name):
+        return len(bpy.data.objects[name].data.vertices)
+
+    def _npmat(a):
+        return Matrix([[float(a[i][j]) for j in range(4)] for i in range(4)])
+
+    # Pass 1: keep the meshes that land near the reference (ref's own render pass).
+    kept, removed, deferred = [], 0, []
+    kept_by_vc = {}
     for ob in list(objs):
         if ob.type != "MESH" or ob.name not in Ms:
             continue
@@ -281,14 +289,46 @@ def reconstruct(objs, frame_dir):
         rel = rel / rel[3, 3]
         placed = (rel @ np.append(pre_c[ob.name], 1.0))[:3]
         if float(np.linalg.norm(placed - ref_c)) <= keep_radius:
-            relM = Matrix([[float(rel[i][j]) for j in range(4)] for i in range(4)])
-            ob.matrix_world = relM @ ob.matrix_world
+            ob.matrix_world = _npmat(rel) @ ob.matrix_world
             kept.append(ob)
+            kept_by_vc.setdefault(_vc(ob.name), ob)
+        else:
+            deferred.append(ob)
+
+    # Pass 2: a deferred draw is either a duplicate of a kept part (same vertex
+    # count -> another render pass of the same mesh; drop it) or a UNIQUE part that
+    # only exists in another pass (e.g. the eyeballs). The latter can't be placed by
+    # M_ref because its View differs, but it CAN be anchored through a "bridge": a
+    # draw sharing its pass whose geometry WAS kept. Then, with K/bridge being the
+    # same mesh in two passes (World cancels):
+    #     ob_world = K.matrix_world @ (M_bridge^-1 @ M_ob)  ==  World_ref^-1 @ World_ob
+    recovered = 0
+    for ob in deferred:
+        if _vc(ob.name) in kept_by_vc:
+            bpy.data.objects.remove(ob, do_unlink=True)
+            removed += 1
+            continue
+        anchor = None
+        for bn in Ms:
+            if bn == ob.name or _vc(bn) not in kept_by_vc:
+                continue
+            relb = np.linalg.inv(Ms[bn]) @ Ms[ob.name]
+            relb = relb / relb[3, 3]
+            # same pass  <=>  projection cancels  <=>  affine, no perspective row
+            if (abs(relb[3, 0]) + abs(relb[3, 1]) + abs(relb[3, 2]) < 1e-4
+                    and 0.5 < abs(np.linalg.det(relb[:3, :3])) < 2.0):
+                anchor = (kept_by_vc[_vc(bn)], relb)
+                break
+        if anchor:
+            K, relb = anchor
+            ob.matrix_world = K.matrix_world @ _npmat(relb)
+            kept.append(ob)
+            recovered += 1
         else:
             bpy.data.objects.remove(ob, do_unlink=True)
             removed += 1
-    print("reconstruct: ref=%s  kept %d same-pass meshes, removed %d other-pass copies"
-          % (ref, len(kept), removed))
+    print("reconstruct: ref=%s  kept %d same-pass + %d recovered cross-pass, removed %d copies"
+          % (ref, len(kept) - recovered, recovered, removed))
     return kept
 
 
