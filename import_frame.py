@@ -118,6 +118,28 @@ def get_clean_collection(name):
     return coll
 
 
+def purge_empty_addon_groups():
+    """Remove empty 'grp_<n>.nr' collections the importer leaves behind.
+
+    io_import_nr creates one per-file group collection (``grp_0.nr`` ...) on every
+    import and links it under the scene root. main() then moves the imported
+    meshes into the mode collection, and reconstruct() deletes the duplicate
+    passes, so these group collections end up empty. Without this they pile up on
+    every re-run (``grp_0.nr.001``, ``.002`` ...) and clutter the outliner.
+    Only collections that are genuinely empty (no objects, no children) are
+    removed, so real data is never touched.
+    """
+    removed = 0
+    for c in list(bpy.data.collections):
+        if (re.match(r"grp_\d+\.nr(\.\d+)?$", c.name)
+                and not c.objects and not c.children):
+            bpy.data.collections.remove(c)
+            removed += 1
+    if removed:
+        print("cleanup: removed %d empty addon group collection(s)" % removed)
+    return removed
+
+
 def set_active_collection(coll):
     """Point bpy.context.collection at `coll` so the importer links objects there."""
     vl = bpy.context.view_layer
@@ -326,6 +348,7 @@ def main():
         raise RuntimeError("Frame folder not found: %s" % FRAME_DIR)
 
     ensure_addon()
+    purge_empty_addon_groups()      # clear stale empty grp_* from earlier runs
 
     files = mesh_files(FRAME_DIR)
     if not files:
@@ -372,6 +395,11 @@ def main():
         if rot is not None:
             for ob in new_objs:
                 ob.matrix_world = rot @ ob.matrix_world
+
+    # The importer's per-file group collections are now empty (meshes were moved
+    # into our collection and pass-duplicates deleted); drop them so the outliner
+    # holds only the assembled character.
+    purge_empty_addon_groups()
 
     summarize(new_objs)
     print("Done in %.1fs -> collection '%s'" % (time.time() - t0, coll.name))
