@@ -124,40 +124,18 @@ def _combined_bbox(objs):
 def _upright_rotation(objs):
     """Rotate the longest bbox axis onto +Z so a character stands up.
 
-    The sign is chosen with a centroid heuristic: a standing figure carries more
-    geometry (legs, torso, skirt) in its lower half, so the mean vertex sits
-    below the bbox centre along the height axis. We pick the rotation that puts
-    the heavier end at the bottom. `UPRIGHT_FLIP` forces the opposite choice.
+    The base mapping is chosen so this game's models land head-up; if a model
+    from another game comes in upside down, set UPRIGHT_FLIP=True to add 180deg.
     """
-    from mathutils import Vector
-    mn, mx, dims = _combined_bbox(objs)
+    _, _, dims = _combined_bbox(objs)
     up = dims.index(max(dims))
-    if up == 2:
+    if up == 2:                                     # already tall along Z
         base = Matrix.Identity(4)
     elif up == 0:                                   # tall along X
         base = Matrix.Rotation(math.radians(90.0), 4, "Y")
     else:                                           # tall along Y (typical Y-up)
         base = Matrix.Rotation(math.radians(-90.0), 4, "X")
-
-    # mean vertex position (world), then rotated
-    tot = Vector((0, 0, 0))
-    n = 0
-    for ob in objs:
-        if ob.type != "MESH":
-            continue
-        m = ob.matrix_world
-        for v in ob.data.vertices:
-            tot += m @ v.co
-            n += 1
-    flip = False
-    if n:
-        mean_z = (base @ (tot / n)).z
-        center_z = (base @ (Vector(mn) + Vector(mx)) * 0.5).z
-        # heavier end should be at the bottom -> mean below centre
-        flip = mean_z > center_z
     if UPRIGHT_FLIP:
-        flip = not flip
-    if flip:
         base = Matrix.Rotation(math.radians(180.0), 4, "X") @ base
     return base
 
