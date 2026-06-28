@@ -46,6 +46,7 @@ CLEAR_COLLECTION = globals().get("CLEAR_COLLECTION", True)
 # Game models are usually Y-up; Blender is Z-up. Rotate +90deg about X so the
 # character stands upright. Geometry is unchanged, only the orientation.
 STAND_UPRIGHT = globals().get("STAND_UPRIGHT", True)
+UPRIGHT_FLIP = globals().get("UPRIGHT_FLIP", False)   # flip if a model lands upside down
 # Only used when MODE == "world" (capture was 2560x1600; FOV is a guess):
 WORLD_SCR_W, WORLD_SCR_H, WORLD_FOV = 2560.0, 1600.0, 45.0
 
@@ -121,14 +122,44 @@ def _combined_bbox(objs):
 
 
 def _upright_rotation(objs):
-    """Rotate the longest bbox axis onto +Z (X->Z via Y; Y->Z via X)."""
-    _, _, dims = _combined_bbox(objs)
+    """Rotate the longest bbox axis onto +Z so a character stands up.
+
+    The sign is chosen with a centroid heuristic: a standing figure carries more
+    geometry (legs, torso, skirt) in its lower half, so the mean vertex sits
+    below the bbox centre along the height axis. We pick the rotation that puts
+    the heavier end at the bottom. `UPRIGHT_FLIP` forces the opposite choice.
+    """
+    from mathutils import Vector
+    mn, mx, dims = _combined_bbox(objs)
     up = dims.index(max(dims))
-    if up == 0:   # tall along X
-        return Matrix.Rotation(math.radians(-90.0), 4, "Y")
-    if up == 1:   # tall along Y (typical Y-up game)
-        return Matrix.Rotation(math.radians(90.0), 4, "X")
-    return None   # already tall along Z
+    if up == 2:
+        base = Matrix.Identity(4)
+    elif up == 0:                                   # tall along X
+        base = Matrix.Rotation(math.radians(90.0), 4, "Y")
+    else:                                           # tall along Y (typical Y-up)
+        base = Matrix.Rotation(math.radians(-90.0), 4, "X")
+
+    # mean vertex position (world), then rotated
+    tot = Vector((0, 0, 0))
+    n = 0
+    for ob in objs:
+        if ob.type != "MESH":
+            continue
+        m = ob.matrix_world
+        for v in ob.data.vertices:
+            tot += m @ v.co
+            n += 1
+    flip = False
+    if n:
+        mean_z = (base @ (tot / n)).z
+        center_z = (base @ (Vector(mn) + Vector(mx)) * 0.5).z
+        # heavier end should be at the bottom -> mean below centre
+        flip = mean_z > center_z
+    if UPRIGHT_FLIP:
+        flip = not flip
+    if flip:
+        base = Matrix.Rotation(math.radians(180.0), 4, "X") @ base
+    return base
 
 
 def mesh_files(frame_dir):
