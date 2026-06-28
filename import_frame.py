@@ -273,8 +273,12 @@ def reconstruct(objs, frame_dir):
     ref_diag = Vector(bpy.data.objects[ref].dimensions).length or 1.0
     keep_radius = RECON_KEEP_FACTOR * ref_diag
 
+    # Snapshot vertex counts now, while every draw still exists as an object
+    # (bridges may reference draws that get removed as duplicates below).
+    vc_of = {n: len(bpy.data.objects[n].data.vertices) for n in Ms}
+
     def _vc(name):
-        return len(bpy.data.objects[name].data.vertices)
+        return vc_of.get(name, -1)
 
     def _npmat(a):
         return Matrix([[float(a[i][j]) for j in range(4)] for i in range(4)])
