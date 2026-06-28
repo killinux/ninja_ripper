@@ -67,6 +67,13 @@ RECON_KEEP_FACTOR = globals().get("RECON_KEEP_FACTOR", 2.5)  # keep meshes place
 # LUTs), then wire it into Base Color. See fix_materials().
 FIX_MATERIALS = globals().get("FIX_MATERIALS", True)
 
+# Albedo the content/UV heuristics can't infer, keyed by PreVS vertex count ->
+# (texture-name-substring, uv-layer). The eyeball binds BOTH a sclera (light,
+# which the heuristic picks -> "white eyes") and the iris; the iris is the real
+# eye albedo and uses its own sphere-wrap uv_0. This pins it. {} for an unknown
+# model (then eyes fall back to the heuristic).
+ALBEDO_OVERRIDES = globals().get("ALBEDO_OVERRIDES", {458: ("A9F630", "uv_0")})
+
 # Game models are usually not Z-up. Rotate the longest bbox axis onto +Z so the
 # character stands upright. Geometry is unchanged, only the orientation.
 STAND_UPRIGHT = globals().get("STAND_UPRIGHT", True)
@@ -430,15 +437,23 @@ def _coherent_uv(me, np):
     if not pairs:
         return me.uv_layers[0].name
     pairs = np.asarray(pairs)
-    best = None
+    best = best_any = None
     for L in me.uv_layers:
         uv = np.empty(nloops * 2, np.float32)
         L.data.foreach_get("uv", uv)
         uv = uv.reshape(-1, 2)
         d = float(np.linalg.norm(uv[pairs[:, 0]] - uv[pairs[:, 1]], axis=1).mean())
+        if best_any is None or d < best_any[1]:
+            best_any = (L.name, d)
+        # Skip degenerate layers that collapse to a point/line (tiny UV bbox):
+        # they have the smallest edge jump but map the whole mesh to one texel
+        # (e.g. the eyeball's secondary UV), which would win wrongly.
+        span = (uv.max(0) - uv.min(0))
+        if float(span[0] * span[1]) < 0.02:
+            continue
         if best is None or d < best[1]:
             best = (L.name, d)
-    return best[0]
+    return (best or best_any)[0]
 
 
 def _set_albedo_material(ob, img_path, with_alpha, uv_name):
@@ -488,8 +503,23 @@ def fix_materials(objs, frame_dir):
     freq = Counter(t for s in cand.values() for t in s)
     shared = {t for t, c in freq.items() if c >= max(3, len(cand) // 2)}
 
+    def _by_suffix(sub):
+        for fn in os.listdir(frame_dir):
+            if fn.lower().endswith(".dds") and sub.lower() in fn.lower():
+                return fn
+        return None
+
     fixed = 0
     for o in meshes:
+        # Explicit override (e.g. the eyeball iris) wins over the heuristic.
+        ov = ALBEDO_OVERRIDES.get(len(o.data.vertices))
+        if ov:
+            fn = _by_suffix(ov[0])
+            if fn:
+                _set_albedo_material(o, os.path.join(frame_dir, fn), False, ov[1])
+                fixed += 1
+                print("fix_materials: %-12s -> %s  uv=%s  (override)" % (o.name, fn, ov[1]))
+                continue
         best = None  # (score, filename, has_alpha)
         for tex in sorted(cand[o.name] - shared):
             p = os.path.join(frame_dir, tex)
