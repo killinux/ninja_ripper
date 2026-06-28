@@ -50,6 +50,21 @@ UPRIGHT_FLIP = globals().get("UPRIGHT_FLIP", False)   # flip if a model lands up
 # Only used when MODE == "world" (capture was 2560x1600; FOV is a guess):
 WORLD_SCR_W, WORLD_SCR_H, WORLD_FOV = 2560.0, 1600.0, 45.0
 
+# Head repositioning (PreVS skinned heads come in at their own local origin, so
+# the face/head lands away from the neck). We snap the head group onto the neck
+# of the tallest body mesh. See fix_head_position().
+FIX_HEAD = globals().get("FIX_HEAD", True)
+# Mesh tokens (the "mesh_N" part of the object name) that make up the head.
+HEAD_MESHES = globals().get("HEAD_MESHES", ["mesh_3", "mesh_12", "mesh_19"])
+# Body reference for the neck anchor; None = auto-pick the tallest mesh.
+HEAD_BODY_REF = globals().get("HEAD_BODY_REF", None)
+# Manual override: if set to (dx, dy, dz) the head group is just translated by
+# this (world space) instead of auto-anchoring to the neck.
+HEAD_OFFSET = globals().get("HEAD_OFFSET", None)
+# Fine-tune knobs for the auto anchor:
+HEAD_ANCHOR_FRACTION = globals().get("HEAD_ANCHOR_FRACTION", 0.12)  # top % of body = neck/head band
+HEAD_Z_BIAS = globals().get("HEAD_Z_BIAS", 0.0)                     # nudge head up(+)/down(-)
+
 ADDON = "io_import_nr"
 
 
@@ -138,6 +153,68 @@ def _upright_rotation(objs):
     if UPRIGHT_FLIP:
         base = Matrix.Rotation(math.radians(180.0), 4, "X") @ base
     return base
+
+
+def _head_token(name):
+    """'mesh_3.nr' / 'mesh_3.nr.001' -> 'mesh_3'."""
+    return name.split(".nr")[0]
+
+
+def _world_verts(ob):
+    from mathutils import Vector
+    m = ob.matrix_world
+    return [m @ Vector(v.co) for v in ob.data.vertices]
+
+
+def fix_head_position(objs):
+    """Snap the head group onto the neck of the tallest (body) mesh.
+
+    PreVS skinned heads keep their own local origin, so the head lands off the
+    body. We compute the neck anchor as the centroid of the body's top
+    HEAD_ANCHOR_FRACTION of vertices and move the head group so its centre sits
+    at (anchor.x, anchor.y, body_top - head_height/2 + HEAD_Z_BIAS). Idempotent
+    (recomputes from current positions), so it can be re-run safely.
+    """
+    from mathutils import Vector, Matrix
+
+    heads = [o for o in objs if o.type == "MESH" and _head_token(o.name) in HEAD_MESHES]
+    if not heads:
+        print("fix_head_position: no head meshes %s found, skipping" % HEAD_MESHES)
+        return
+
+    # Current head-group centre + height
+    hv = []
+    for o in heads:
+        hv += _world_verts(o)
+    hc = sum(hv, Vector()) / len(hv)
+    head_h = max(v.z for v in hv) - min(v.z for v in hv)
+
+    if HEAD_OFFSET is not None:
+        delta = Vector(HEAD_OFFSET)
+    else:
+        # Body reference: explicit name, else the tallest non-head mesh.
+        body = None
+        if HEAD_BODY_REF:
+            body = bpy.data.objects.get(HEAD_BODY_REF)
+        if body is None:
+            cands = [o for o in objs if o.type == "MESH"
+                     and _head_token(o.name) not in HEAD_MESHES]
+            body = max(cands, key=lambda o: o.dimensions.z, default=None)
+        if body is None:
+            print("fix_head_position: no body reference, skipping")
+            return
+        bv = [v.z for v in _world_verts(body)]
+        btop, bbot = max(bv), min(bv)
+        thr = btop - HEAD_ANCHOR_FRACTION * (btop - bbot)
+        band = [v for v in _world_verts(body) if v.z >= thr]
+        anchor = sum(band, Vector()) / len(band)
+        target = Vector((anchor.x, anchor.y, btop - head_h * 0.5 + HEAD_Z_BIAS))
+        delta = target - hc
+
+    for o in heads:
+        o.matrix_world = Matrix.Translation(delta) @ o.matrix_world
+    print("fix_head_position: moved %d head obj(s) by (%.3f, %.3f, %.3f)"
+          % (len(heads), delta.x, delta.y, delta.z))
 
 
 def mesh_files(frame_dir):
@@ -258,6 +335,10 @@ def main():
         if rot is not None:
             for ob in new_objs:
                 ob.matrix_world = rot @ ob.matrix_world
+
+    # Snap the skinned head group back onto the neck (must run after upright).
+    if FIX_HEAD and MODE == "prevs":
+        fix_head_position(new_objs)
 
     summarize(new_objs)
     print("Done in %.1fs -> collection '%s'" % (time.time() - t0, coll.name))

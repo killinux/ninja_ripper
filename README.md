@@ -46,3 +46,21 @@ Edit the constants at the top of `import_frame.py`:
 The script prints a per-object report (verts / faces / has-UV / has-material /
 texture name) plus how many textures loaded vs. failed, so correctness is easy
 to confirm.
+
+## Head repositioning
+
+In `prevs` mode a skinned head keeps its own local origin, so the face/head
+lands off the body (for this capture it sat at the navel). `fix_head_position()`
+snaps the head group onto the neck of the tallest body mesh:
+
+- `FIX_HEAD` — enable (default `True`).
+- `HEAD_MESHES` — mesh tokens that form the head (default
+  `["mesh_3", "mesh_12", "mesh_19"]` — the three depth/shadow/main copies).
+- `HEAD_BODY_REF` — body mesh name for the neck anchor; `None` auto-picks the
+  tallest mesh.
+- `HEAD_OFFSET` — set to `(dx, dy, dz)` to translate the head manually instead
+  of auto-anchoring.
+- `HEAD_ANCHOR_FRACTION` / `HEAD_Z_BIAS` — fine-tune the neck band and the final
+  up/down nudge.
+
+The anchor is recomputed from current positions each run, so it is idempotent.
