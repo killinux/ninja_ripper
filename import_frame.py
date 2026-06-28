@@ -29,7 +29,9 @@ import os
 import re
 import glob
 import time
+import math
 import addon_utils
+from mathutils import Matrix
 
 # --------------------------------------------------------------------------- #
 # Config — edit these (or set the matching globals before exec()'ing the file) #
@@ -41,6 +43,9 @@ FRAME_DIR = globals().get(
 )
 MODE = globals().get("MODE", "prevs")          # "prevs" = Local/T-pose | "world" = world-space
 CLEAR_COLLECTION = globals().get("CLEAR_COLLECTION", True)
+# Game models are usually Y-up; Blender is Z-up. Rotate +90deg about X so the
+# character stands upright. Geometry is unchanged, only the orientation.
+STAND_UPRIGHT = globals().get("STAND_UPRIGHT", True)
 # Only used when MODE == "world" (capture was 2560x1600; FOV is a guess):
 WORLD_SCR_W, WORLD_SCR_H, WORLD_FOV = 2560.0, 1600.0, 45.0
 
@@ -210,6 +215,12 @@ def main():
             for c in ob.users_collection:
                 c.objects.unlink(ob)
             coll.objects.link(ob)
+
+    # Y-up (game) -> Z-up (Blender): stand the models upright about world origin.
+    if STAND_UPRIGHT:
+        rot = Matrix.Rotation(math.radians(90.0), 4, "X")
+        for ob in new_objs:
+            ob.matrix_world = rot @ ob.matrix_world
 
     summarize(new_objs)
     print("Done in %.1fs -> collection '%s'" % (time.time() - t0, coll.name))
