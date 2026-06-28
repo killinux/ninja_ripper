@@ -366,7 +366,38 @@ def _classify_tex(path, np):
     return out
 
 
-def _set_albedo_material(ob, img_path, with_alpha):
+def _coherent_uv(me, np):
+    """Name of the UV layer whose islands are spatially continuous.
+
+    The PreVS import dumps every texcoord set as uv_0..uv_N, but only one is the
+    real diffuse UV; the rest are mis-unpacked and come out as per-vertex noise
+    (huge per-edge jumps in UV space), which paints any texture as speckle. The
+    correct layer has, by far, the smallest mean per-edge UV jump (~0.01 vs ~0.5).
+    This is why the head needs uv_5 while the body/armor need uv_7.
+    """
+    if not me.uv_layers:
+        return None
+    nloops = len(me.loops)
+    pairs = []
+    for p in me.polygons:
+        ls = list(p.loop_indices)
+        for k in range(len(ls)):
+            pairs.append((ls[k], ls[(k + 1) % len(ls)]))
+    if not pairs:
+        return me.uv_layers[0].name
+    pairs = np.asarray(pairs)
+    best = None
+    for L in me.uv_layers:
+        uv = np.empty(nloops * 2, np.float32)
+        L.data.foreach_get("uv", uv)
+        uv = uv.reshape(-1, 2)
+        d = float(np.linalg.norm(uv[pairs[:, 0]] - uv[pairs[:, 1]], axis=1).mean())
+        if best is None or d < best[1]:
+            best = (L.name, d)
+    return best[0]
+
+
+def _set_albedo_material(ob, img_path, with_alpha, uv_name):
     img = bpy.data.images.load(img_path, check_existing=True)
     img.colorspace_settings.name = "sRGB"
     mat = bpy.data.materials.new("mat_%s" % _file_token(ob.name))
@@ -383,8 +414,12 @@ def _set_albedo_material(ob, img_path, with_alpha):
         mat.shadow_method = "HASHED"
     nt.links.new(out.inputs["Surface"], bsdf.outputs["BSDF"])
     me = ob.data
-    if me.uv_layers and "uv_0" in me.uv_layers:
-        me.uv_layers.active = me.uv_layers["uv_0"]
+    # The Image Texture node has no UV Map node, so it samples the *render*-active
+    # UV; point that (and the edit-active) at the continuous diffuse layer.
+    if uv_name and uv_name in me.uv_layers:
+        for L in me.uv_layers:
+            L.active_render = (L.name == uv_name)
+        me.uv_layers.active = me.uv_layers[uv_name]
     me.materials.clear()
     me.materials.append(mat)
 
@@ -418,10 +453,11 @@ def fix_materials(objs, frame_dir):
             if ok and (best is None or score > best[0]):
                 best = (score, tex, has_alpha)
         if best:
-            _set_albedo_material(o, os.path.join(frame_dir, best[1]), best[2])
+            uv_name = _coherent_uv(o.data, np)
+            _set_albedo_material(o, os.path.join(frame_dir, best[1]), best[2], uv_name)
             fixed += 1
-            print("fix_materials: %-12s -> %s%s"
-                  % (o.name, best[1], "  (+alpha)" if best[2] else ""))
+            print("fix_materials: %-12s -> %s  uv=%s%s"
+                  % (o.name, best[1], uv_name, "  (+alpha)" if best[2] else ""))
         else:
             print("fix_materials: %-12s -> no albedo candidate found" % o.name)
     print("fix_materials: set albedo on %d/%d meshes" % (fixed, len(meshes)))
