@@ -105,6 +105,32 @@ def set_active_collection(coll):
         vl.active_layer_collection = lc
 
 
+def _combined_bbox(objs):
+    from mathutils import Vector
+    mn = [1e18] * 3
+    mx = [-1e18] * 3
+    for ob in objs:
+        if ob.type != "MESH":
+            continue
+        for corner in ob.bound_box:
+            w = ob.matrix_world @ Vector(corner)
+            for i in range(3):
+                mn[i] = min(mn[i], w[i])
+                mx[i] = max(mx[i], w[i])
+    return mn, mx, [mx[i] - mn[i] for i in range(3)]
+
+
+def _upright_rotation(objs):
+    """Rotate the longest bbox axis onto +Z (X->Z via Y; Y->Z via X)."""
+    _, _, dims = _combined_bbox(objs)
+    up = dims.index(max(dims))
+    if up == 0:   # tall along X
+        return Matrix.Rotation(math.radians(-90.0), 4, "Y")
+    if up == 1:   # tall along Y (typical Y-up game)
+        return Matrix.Rotation(math.radians(90.0), 4, "X")
+    return None   # already tall along Z
+
+
 def mesh_files(frame_dir):
     files = sorted(glob.glob(os.path.join(frame_dir, "mesh_*.nr")), key=_natural_key)
     return files
@@ -216,11 +242,13 @@ def main():
                 c.objects.unlink(ob)
             coll.objects.link(ob)
 
-    # Y-up (game) -> Z-up (Blender): stand the models upright about world origin.
+    # Stand the models upright (Z-up). The game's "up" axis varies, so detect it
+    # as the longest bounding-box dimension and rotate that axis onto +Z.
     if STAND_UPRIGHT:
-        rot = Matrix.Rotation(math.radians(90.0), 4, "X")
-        for ob in new_objs:
-            ob.matrix_world = rot @ ob.matrix_world
+        rot = _upright_rotation(new_objs)
+        if rot is not None:
+            for ob in new_objs:
+                ob.matrix_world = rot @ ob.matrix_world
 
     summarize(new_objs)
     print("Done in %.1fs -> collection '%s'" % (time.time() - t0, coll.name))
