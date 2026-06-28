@@ -80,6 +80,10 @@ ALBEDO_OVERRIDES = globals().get("ALBEDO_OVERRIDES", {458: ("30D730", "uv_0")})
 STAND_UPRIGHT = globals().get("STAND_UPRIGHT", True)
 UPRIGHT_FLIP = globals().get("UPRIGHT_FLIP", False)   # flip if a model lands upside down
 
+# Drop the assembled character so its feet rest on the ground plane (lowest point
+# at Z=0) and center it on the world origin in X/Y.
+GROUND_SNAP = globals().get("GROUND_SNAP", True)
+
 # Only used when MODE == "world" (capture was 2560x1600; FOV is a guess):
 WORLD_SCR_W, WORLD_SCR_H, WORLD_FOV = 2560.0, 1600.0, 45.0
 
@@ -205,6 +209,19 @@ def _upright_rotation(objs):
     if UPRIGHT_FLIP:
         base = Matrix.Rotation(math.radians(180.0), 4, "X") @ base
     return base
+
+
+def snap_to_ground(objs):
+    """Translate so the lowest mesh point sits on Z=0 and X/Y is centered at origin."""
+    mn, mx, _ = _combined_bbox(objs)
+    if mn[0] > mx[0]:                       # no mesh geometry
+        return
+    cx = (mn[0] + mx[0]) * 0.5
+    cy = (mn[1] + mx[1]) * 0.5
+    T = Matrix.Translation((-cx, -cy, -mn[2]))
+    for ob in objs:
+        ob.matrix_world = T @ ob.matrix_world
+    print("snap_to_ground: feet at Z=0, centered (was minZ=%.3f)" % mn[2])
 
 
 # --------------------------------------------------------------------------- #
@@ -649,6 +666,10 @@ def main():
         if rot is not None:
             for ob in new_objs:
                 ob.matrix_world = rot @ ob.matrix_world
+
+    # Stand the character on the ground plane (feet at Z=0), centered at origin.
+    if GROUND_SNAP:
+        snap_to_ground(new_objs)
 
     # Replace the addon's AUTO texturing with the correct albedo per mesh.
     if FIX_MATERIALS and MODE == "prevs":
