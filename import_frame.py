@@ -59,6 +59,14 @@ RECONSTRUCT = globals().get("RECONSTRUCT", True)
 RECON_REF = globals().get("RECON_REF", None)        # reference object name; None = mesh with most verts
 RECON_KEEP_FACTOR = globals().get("RECON_KEEP_FACTOR", 2.5)  # keep meshes placed within FACTOR*ref_diag (same pass)
 
+# Replace the addon's AUTO texturing with the correct albedo per mesh. The .nr
+# records every bound texture at bindSlot 0 (no diffuse/normal/mask distinction),
+# so AUTO often picks a normal/flow-mask (e.g. green hair) or nothing at all. We
+# gather all textures bound to each mesh's geometry across every render pass and
+# choose the albedo by content (skip normal/blue/packed/pure-mask/black + shared
+# LUTs), then wire it into Base Color. See fix_materials().
+FIX_MATERIALS = globals().get("FIX_MATERIALS", True)
+
 # Game models are usually not Z-up. Rotate the longest bbox axis onto +Z so the
 # character stands upright. Geometry is unchanged, only the orientation.
 STAND_UPRIGHT = globals().get("STAND_UPRIGHT", True)
@@ -284,6 +292,141 @@ def reconstruct(objs, frame_dir):
     return kept
 
 
+# --------------------------------------------------------------------------- #
+# Correct-albedo material fix                                                  #
+# --------------------------------------------------------------------------- #
+def _tex_by_vcount(frame_dir, nrfile):
+    """vertex-count -> set of texture filenames bound to that geometry anywhere.
+
+    The same mesh is drawn several times (color/depth/shadow passes); only some
+    passes bind the full texture set. Keying by PreVS vertex count groups all
+    passes of one part, so a kept mesh whose own draw bound no texture still finds
+    its textures from a sibling pass.
+    """
+    table = {}
+    for f in sorted(glob.glob(os.path.join(frame_dir, "mesh_*.nr")), key=_natural_key):
+        nr = nrfile.NRFile()
+        if not nr.parse(f):
+            continue
+        for i in range(nr.getMeshCount()):
+            g = nr.getMesh(i)
+            v = g.getVertexes(0)
+            if not v:
+                continue
+            txs = g.getTextures()
+            if not txs:
+                continue
+            vc = v.getVertexCount()
+            for t in range(txs.getTexturesCount()):
+                table.setdefault(vc, set()).add(txs.getTexture(t).fileName)
+    return table
+
+
+def _classify_tex(path, np):
+    """Load a .dds and decide if it's an albedo; return (is_albedo, score, has_alpha).
+
+    Albedo = natural skin/cloth tone (R>=G>=B-ish, moderate saturation) or a light
+    grey with strand-alpha (silver hair). Rejected: normal maps (blue-dominant or
+    the R~1,G~B~0.5 pack), pure-hue masks, black/undecodable LUTs.
+    """
+    pre = set(bpy.data.images.keys())
+    try:
+        img = bpy.data.images.load(path, check_existing=True)
+    except Exception:
+        return (False, 0.0, False)
+    new = img.name not in pre
+    w, h = img.size
+    out = (False, 0.0, False)
+    try:
+        if w * h > 0 and img.has_data:
+            a = np.empty(w * h * 4, np.float32)
+            img.pixels.foreach_get(a)
+            a = a.reshape(-1, 4)
+            if len(a) > 40000:
+                a = a[np.linspace(0, len(a) - 1, 40000).astype(np.int64)]
+            rgb = a[:, :3]
+            m = rgb.mean(0)
+            sat = float(((rgb.max(1) - rgb.min(1)) / (rgb.max(1) + 1e-6)).mean())
+            amin = float(a[:, 3].min())
+            R, G, B = (float(m[0]), float(m[1]), float(m[2]))
+            packed = (R > 0.85 and 0.40 < G < 0.62 and 0.40 < B < 0.62)
+            blue = (B > R + 0.15 and B > 0.55)
+            puremask = ((G > 0.55 and R < 0.20) or (R > 0.55 and G < 0.20 and B < 0.20))
+            black = (R < 0.05 and G < 0.05 and B < 0.05)
+            graylo = sat < 0.10
+            natural = (R + 0.03 >= G >= B - 0.06) and 0.10 <= sat <= 0.65
+            is_albedo = (not (packed or blue or puremask or black)
+                         and (natural or (graylo and amin < 0.6 and float(m.mean()) > 0.4)))
+            score = (2.0 if natural else (1.0 if graylo else 0.0)) + min(w, 2048) / 2048.0
+            out = (bool(is_albedo), float(score), bool(amin < 0.6))
+    except Exception:
+        pass
+    if new and img.users == 0:
+        bpy.data.images.remove(img)
+    return out
+
+
+def _set_albedo_material(ob, img_path, with_alpha):
+    img = bpy.data.images.load(img_path, check_existing=True)
+    img.colorspace_settings.name = "sRGB"
+    mat = bpy.data.materials.new("mat_%s" % _file_token(ob.name))
+    mat.use_nodes = True
+    nt = mat.node_tree
+    nt.nodes.clear()
+    out = nt.nodes.new("ShaderNodeOutputMaterial"); out.location = (300, 0)
+    bsdf = nt.nodes.new("ShaderNodeBsdfPrincipled"); bsdf.location = (0, 0)
+    tex = nt.nodes.new("ShaderNodeTexImage"); tex.location = (-400, 0); tex.image = img
+    nt.links.new(bsdf.inputs["Base Color"], tex.outputs["Color"])
+    if with_alpha:
+        nt.links.new(bsdf.inputs["Alpha"], tex.outputs["Alpha"])
+        mat.blend_method = "HASHED"
+        mat.shadow_method = "HASHED"
+    nt.links.new(out.inputs["Surface"], bsdf.outputs["BSDF"])
+    me = ob.data
+    if me.uv_layers and "uv_0" in me.uv_layers:
+        me.uv_layers.active = me.uv_layers["uv_0"]
+    me.materials.clear()
+    me.materials.append(mat)
+
+
+def fix_materials(objs, frame_dir):
+    """Give each kept mesh its correct albedo (Base Color), replacing AUTO guesses."""
+    try:
+        import numpy as np
+        import nrfile  # noqa: F401  (import side effect: ensure available)
+    except Exception as e:
+        print("fix_materials: numpy/nrfile unavailable (%s); skipping" % e)
+        return
+    import nrfile as _nr
+    from collections import Counter
+
+    meshes = [o for o in objs if o.type == "MESH"]
+    if not meshes:
+        return
+    table = _tex_by_vcount(frame_dir, _nr)
+    cand = {o.name: set(table.get(len(o.data.vertices), set())) for o in meshes}
+    # Textures bound to many parts are shared LUTs/ramps, never a part's albedo.
+    freq = Counter(t for s in cand.values() for t in s)
+    shared = {t for t, c in freq.items() if c >= max(3, len(cand) // 2)}
+
+    fixed = 0
+    for o in meshes:
+        best = None  # (score, filename, has_alpha)
+        for tex in sorted(cand[o.name] - shared):
+            p = os.path.join(frame_dir, tex)
+            ok, score, has_alpha = _classify_tex(p, np)
+            if ok and (best is None or score > best[0]):
+                best = (score, tex, has_alpha)
+        if best:
+            _set_albedo_material(o, os.path.join(frame_dir, best[1]), best[2])
+            fixed += 1
+            print("fix_materials: %-12s -> %s%s"
+                  % (o.name, best[1], "  (+alpha)" if best[2] else ""))
+        else:
+            print("fix_materials: %-12s -> no albedo candidate found" % o.name)
+    print("fix_materials: set albedo on %d/%d meshes" % (fixed, len(meshes)))
+
+
 def mesh_files(frame_dir):
     return sorted(glob.glob(os.path.join(frame_dir, "mesh_*.nr")), key=_natural_key)
 
@@ -395,6 +538,10 @@ def main():
         if rot is not None:
             for ob in new_objs:
                 ob.matrix_world = rot @ ob.matrix_world
+
+    # Replace the addon's AUTO texturing with the correct albedo per mesh.
+    if FIX_MATERIALS and MODE == "prevs":
+        fix_materials(new_objs, FRAME_DIR)
 
     # The importer's per-file group collections are now empty (meshes were moved
     # into our collection and pass-duplicates deleted); drop them so the outliner
