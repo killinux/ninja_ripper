@@ -19,6 +19,10 @@ Either mode auto-binds DDS textures (`texturingTab=AUTO`) and split normals
 (`normalsTab=AUTO`), and drops every object into a dedicated collection named
 `<frame>_<mode>` so re-runs are idempotent.
 
+In `prevs` mode a **projection-free reconstruction** then assembles the parts
+correctly (see below) — this is the recommended path: exact geometry *and*
+correct placement.
+
 ## Workflow (Mac writes, remote Windows runs)
 
 ```
@@ -40,27 +44,43 @@ Edit the constants at the top of `import_frame.py`:
 
 - `FRAME_DIR` — the `...\frame_N` folder to import (the `.dds` files must sit
   next to the `.nr` files, which is how Ninja Ripper exports them).
-- `MODE` — `"prevs"` or `"world"`.
+- `MODE` — `"prevs"` (recommended) or `"world"`.
 - `CLEAR_COLLECTION` — empty a previous import of the same name before re-importing.
+- `RECONSTRUCT` / `RECON_REF` / `RECON_KEEP_FACTOR` — see below.
 
 The script prints a per-object report (verts / faces / has-UV / has-material /
 texture name) plus how many textures loaded vs. failed, so correctness is easy
 to confirm.
 
-## Head repositioning
+## Projection-free reconstruction (`prevs` mode)
 
-In `prevs` mode a skinned head keeps its own local origin, so the face/head
-lands off the body (for this capture it sat at the navel). `fix_head_position()`
-snaps the head group onto the neck of the tallest body mesh:
+In PreVS each draw comes in at its own bone/local origin, so the head, hair and
+eyes land away from the body (the head's bind origin is the pelvis, not the
+neck). The correct placement only exists in the PostVS data, which is clip space
+`Proj · View · World · local` — and the real projection matrix is **not** in the
+ripper log.
 
-- `FIX_HEAD` — enable (default `True`).
-- `HEAD_MESHES` — mesh tokens that form the head (default
-  `["mesh_3", "mesh_12", "mesh_19"]` — the three depth/shadow/main copies).
-- `HEAD_BODY_REF` — body mesh name for the neck anchor; `None` auto-picks the
-  tallest mesh.
-- `HEAD_OFFSET` — set to `(dx, dy, dz)` to translate the head manually instead
-  of auto-anchoring.
-- `HEAD_ANCHOR_FRACTION` / `HEAD_Z_BIAS` — fine-tune the neck band and the final
-  up/down nudge.
+The key: each draw stores **both** PreVS (local) and PostVS (clip) vertices, 1:1.
+Solving the 4×4 `M` with `PostVS = M · PreVS` gives `M_i = Proj · View · World_i`,
+so for a reference mesh
 
-The anchor is recomputed from current positions each run, so it is idempotent.
+```
+rel_i = M_ref⁻¹ · M_i = World_ref⁻¹ · World_i
+```
+
+and **`Proj` and `View` cancel exactly**. `rel_i` is the exact rigid placement of
+mesh `i` in the reference's space, so applying it assembles the character with
+exact geometry and correct placement — no projection matrix needed.
+
+Ninja Ripper records each draw several times (main camera, shadow, depth) with
+different view matrices, so other-pass copies land far away. `reconstruct()`
+keeps only the meshes near the reference (its own pass) and removes the rest, so
+e.g. this frame's 29 imported objects collapse to the **8** that form one clean
+character.
+
+- `RECONSTRUCT` — enable (default `True`, `prevs` mode only).
+- `RECON_REF` — reference object name; `None` auto-picks the mesh with the most
+  vertices (the main body).
+- `RECON_KEEP_FACTOR` — keep meshes whose placed centroid is within
+  `FACTOR × reference_diagonal` (default `2.5`); separates the reference's pass
+  from the far-away duplicate passes.

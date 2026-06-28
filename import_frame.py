@@ -2,20 +2,28 @@
 import_frame.py
 ================
 Import a Ninja Ripper 2 capture frame folder into a running Blender, using the
-official `io_import_nr` addon.
+official `io_import_nr` addon for geometry/UV/textures, then assemble the
+character correctly with a projection-free clip-space reconstruction.
 
-Default mode is LOCAL / T-pose ("PreVs"):
-  * Geometry is read straight from the model-space vertex buffers, so it needs
-    NO projection matrix and is geometrically exact.
-  * UVs, split normals and DDS textures are bound automatically
-    (texturingTab=AUTO, normalsTab=AUTO).
-  * Every imported object is placed in a dedicated collection named after the
-    frame folder, so re-running is idempotent and the rest of the scene is left
-    untouched.
+Why reconstruction is needed
+----------------------------
+In PreVS (local space) every draw comes in at its own bone/local origin, so the
+head, hair and eyes land away from the body (the head's bind origin is the
+pelvis, not the neck). The correct placement lives only in the PostVS data,
+which is clip space = Proj * View * World * local — and Rise of Eros' real
+projection matrix is not in the ripper log.
 
-World-space scene reconstruction is also available (MODE = "world") but it is
-only approximate here because Rise of Eros' projection matrix is not recoverable
-from the ripper log (it lives in undecoded D3D constant buffers).
+The trick: each draw stores BOTH PreVS (local) and PostVS (clip) vertices, 1:1.
+Solving the 4x4 M with  PostVS = M @ PreVS  gives  M_i = Proj * View * World_i.
+For a reference mesh,
+        rel_i = M_ref^-1 @ M_i = World_ref^-1 @ World_i
+and the unknown Proj and View cancel exactly. rel_i is the exact rigid placement
+of mesh i in the reference's space, so applying it assembles the character with
+EXACT geometry and CORRECT placement, with no projection matrix at all.
+
+Ninja Ripper records each draw several times (main camera, shadow, depth) with
+different view matrices, so other-pass copies land far away; we keep only the
+meshes near the reference (its own pass) and drop the duplicates.
 
 Run it inside the already-open Blender (via Blender MCP):
     exec(open(r'E:\\code\\othercode\\ninja_ripper\\import_frame.py').read())
@@ -30,8 +38,9 @@ import re
 import glob
 import time
 import math
+import sys
 import addon_utils
-from mathutils import Matrix
+from mathutils import Matrix, Vector
 
 # --------------------------------------------------------------------------- #
 # Config — edit these (or set the matching globals before exec()'ing the file) #
@@ -41,29 +50,22 @@ FRAME_DIR = globals().get(
     r"C:\Users\haoni\AppData\Roaming\Ninja Ripper"
     r"\2026.06.28_11.49.25_RiseOfEros.exe_24956\frame_1",
 )
-MODE = globals().get("MODE", "prevs")          # "prevs" = Local/T-pose | "world" = world-space
+MODE = globals().get("MODE", "prevs")          # "prevs" = exact local geometry | "world" = addon's reverse-projection
 CLEAR_COLLECTION = globals().get("CLEAR_COLLECTION", True)
-# Game models are usually Y-up; Blender is Z-up. Rotate +90deg about X so the
+
+# Projection-free clip-space reconstruction (prevs mode only). Places head/hair/
+# eyes/body correctly and removes duplicate render-pass copies. See reconstruct().
+RECONSTRUCT = globals().get("RECONSTRUCT", True)
+RECON_REF = globals().get("RECON_REF", None)        # reference object name; None = mesh with most verts
+RECON_KEEP_FACTOR = globals().get("RECON_KEEP_FACTOR", 2.5)  # keep meshes placed within FACTOR*ref_diag (same pass)
+
+# Game models are usually not Z-up. Rotate the longest bbox axis onto +Z so the
 # character stands upright. Geometry is unchanged, only the orientation.
 STAND_UPRIGHT = globals().get("STAND_UPRIGHT", True)
 UPRIGHT_FLIP = globals().get("UPRIGHT_FLIP", False)   # flip if a model lands upside down
+
 # Only used when MODE == "world" (capture was 2560x1600; FOV is a guess):
 WORLD_SCR_W, WORLD_SCR_H, WORLD_FOV = 2560.0, 1600.0, 45.0
-
-# Head repositioning (PreVS skinned heads come in at their own local origin, so
-# the face/head lands away from the neck). We snap the head group onto the neck
-# of the tallest body mesh. See fix_head_position().
-FIX_HEAD = globals().get("FIX_HEAD", True)
-# Mesh tokens (the "mesh_N" part of the object name) that make up the head.
-HEAD_MESHES = globals().get("HEAD_MESHES", ["mesh_3", "mesh_12", "mesh_19"])
-# Body reference for the neck anchor; None = auto-pick the tallest mesh.
-HEAD_BODY_REF = globals().get("HEAD_BODY_REF", None)
-# Manual override: if set to (dx, dy, dz) the head group is just translated by
-# this (world space) instead of auto-anchoring to the neck.
-HEAD_OFFSET = globals().get("HEAD_OFFSET", None)
-# Fine-tune knobs for the auto anchor:
-HEAD_ANCHOR_FRACTION = globals().get("HEAD_ANCHOR_FRACTION", 0.12)  # top % of body = neck/head band
-HEAD_Z_BIAS = globals().get("HEAD_Z_BIAS", 0.0)                     # nudge head up(+)/down(-)
 
 ADDON = "io_import_nr"
 
@@ -77,10 +79,15 @@ def _natural_key(path):
     return int(m.group(1)) if m else -1
 
 
+def _file_token(obj_name):
+    """'mesh_3.nr' / 'mesh_3.nr.001' -> 'mesh_3.nr' (the backing file name)."""
+    return re.sub(r"\.\d+$", "", obj_name)
+
+
 def ensure_addon():
-    """Make sure the Ninja Ripper 2 importer is enabled; return its operators."""
+    """Make sure the Ninja Ripper 2 importer is enabled and importable."""
     enabled = ADDON in {m.__name__ for m in addon_utils.modules() if
-                         addon_utils.check(m.__name__)[1]}
+                        addon_utils.check(m.__name__)[1]}
     if not enabled:
         addon_utils.enable(ADDON, default_set=True, persistent=True)
     if not hasattr(bpy.ops.import_mesh_prevs, "nr"):
@@ -88,6 +95,14 @@ def ensure_addon():
             "Addon '%s' did not register its operators. Is it installed in "
             "Blender's addons folder?" % ADDON
         )
+    # The addon appends its dir to sys.path on enable; make sure nrfile/nrtools
+    # are importable for the reconstruction step.
+    for mod in addon_utils.modules():
+        if mod.__name__ == ADDON:
+            d = os.path.dirname(mod.__file__)
+            if d not in sys.path:
+                sys.path.append(d)
+            break
 
 
 def get_clean_collection(name):
@@ -122,7 +137,6 @@ def set_active_collection(coll):
 
 
 def _combined_bbox(objs):
-    from mathutils import Vector
     mn = [1e18] * 3
     mx = [-1e18] * 3
     for ob in objs:
@@ -148,78 +162,108 @@ def _upright_rotation(objs):
         base = Matrix.Identity(4)
     elif up == 0:                                   # tall along X
         base = Matrix.Rotation(math.radians(90.0), 4, "Y")
-    else:                                           # tall along Y (typical Y-up)
+    else:                                           # tall along Y
         base = Matrix.Rotation(math.radians(-90.0), 4, "X")
     if UPRIGHT_FLIP:
         base = Matrix.Rotation(math.radians(180.0), 4, "X") @ base
     return base
 
 
-def _head_token(name):
-    """'mesh_3.nr' / 'mesh_3.nr.001' -> 'mesh_3'."""
-    return name.split(".nr")[0]
+# --------------------------------------------------------------------------- #
+# Projection-free clip-space reconstruction                                   #
+# --------------------------------------------------------------------------- #
+def _parse_pre_post(path, nrfile, nrtools, np):
+    """Return (pre Nx3 local, post Nx4 clip) for the draw in `path`, or (None,None)."""
+    if not os.path.isfile(path):
+        return None, None
+    nr = nrfile.NRFile()
+    if not nr.parse(path):
+        return None, None
+    pre = post = None
+    for i in range(nr.getMeshCount()):
+        g = nr.getMesh(i)
+        vert = g.getVertexes(0)
+        vatrs = g.getVertexAttributes(0)
+        if not vert or not vatrs:
+            continue
+        vd = vert.read()
+        pv = vatrs.getAttr(0)
+        if g.getShaderStage() == nrfile.ShaderStage.PreVs:
+            pos = nrtools.unpackVertexComponentVaAsList(
+                vert, vd, vatrs, [[0, 0], [0, 1], [0, 2]])
+            if pos:
+                pre = np.asarray(pos, dtype=float)
+        elif pv.compCount == 4:
+            pos = nrtools.unpackVertexComponentAsList(vert, vd, pv)
+            if pos:
+                post = np.asarray(pos, dtype=float)
+    return pre, post
 
 
-def _world_verts(ob):
-    from mathutils import Vector
-    m = ob.matrix_world
-    return [m @ Vector(v.co) for v in ob.data.vertices]
+def _solve_M(pre, post, np):
+    """Least-squares 4x4 M with  post = M @ [pre,1].  Exact for a rigid draw."""
+    A = np.hstack([pre, np.ones((len(pre), 1))])
+    MT, _, _, _ = np.linalg.lstsq(A, post, rcond=None)
+    return MT.T
 
 
-def fix_head_position(objs):
-    """Snap the head group onto the neck of the tallest (body) mesh.
+def reconstruct(objs, frame_dir):
+    """Assemble the character via rel = M_ref^-1 @ M_mesh (projection cancels).
 
-    PreVS skinned heads keep their own local origin, so the head lands off the
-    body. We compute the neck anchor as the centroid of the body's top
-    HEAD_ANCHOR_FRACTION of vertices and move the head group so its centre sits
-    at (anchor.x, anchor.y, body_top - head_height/2 + HEAD_Z_BIAS). Idempotent
-    (recomputes from current positions), so it can be re-run safely.
+    Places each kept mesh in the reference's space (exact geometry, correct
+    placement) and removes other-render-pass duplicates. Returns the kept objects.
     """
-    from mathutils import Vector, Matrix
+    try:
+        import numpy as np
+        import nrfile
+        import nrtools
+    except Exception as e:
+        print("reconstruct: numpy/nrfile unavailable (%s); skipping" % e)
+        return objs
 
-    heads = [o for o in objs if o.type == "MESH" and _head_token(o.name) in HEAD_MESHES]
-    if not heads:
-        print("fix_head_position: no head meshes %s found, skipping" % HEAD_MESHES)
-        return
+    Ms, pre_c = {}, {}
+    for ob in objs:
+        if ob.type != "MESH":
+            continue
+        pre, post = _parse_pre_post(
+            os.path.join(frame_dir, _file_token(ob.name)), nrfile, nrtools, np)
+        if pre is None or post is None or len(pre) != len(post):
+            continue
+        Ms[ob.name] = _solve_M(pre, post, np)
+        pre_c[ob.name] = pre.mean(0)
 
-    # Current head-group centre + height
-    hv = []
-    for o in heads:
-        hv += _world_verts(o)
-    hc = sum(hv, Vector()) / len(hv)
-    head_h = max(v.z for v in hv) - min(v.z for v in hv)
+    if not Ms:
+        print("reconstruct: no PreVS/PostVS pairs found; skipping")
+        return objs
 
-    if HEAD_OFFSET is not None:
-        delta = Vector(HEAD_OFFSET)
-    else:
-        # Body reference: explicit name, else the tallest non-head mesh.
-        body = None
-        if HEAD_BODY_REF:
-            body = bpy.data.objects.get(HEAD_BODY_REF)
-        if body is None:
-            cands = [o for o in objs if o.type == "MESH"
-                     and _head_token(o.name) not in HEAD_MESHES]
-            body = max(cands, key=lambda o: o.dimensions.z, default=None)
-        if body is None:
-            print("fix_head_position: no body reference, skipping")
-            return
-        bv = [v.z for v in _world_verts(body)]
-        btop, bbot = max(bv), min(bv)
-        thr = btop - HEAD_ANCHOR_FRACTION * (btop - bbot)
-        band = [v for v in _world_verts(body) if v.z >= thr]
-        anchor = sum(band, Vector()) / len(band)
-        target = Vector((anchor.x, anchor.y, btop - head_h * 0.5 + HEAD_Z_BIAS))
-        delta = target - hc
+    ref = RECON_REF if (RECON_REF in Ms) else max(
+        Ms, key=lambda n: len(bpy.data.objects[n].data.vertices))
+    M_ref_inv = np.linalg.inv(Ms[ref])
+    ref_c = pre_c[ref]
+    ref_diag = Vector(bpy.data.objects[ref].dimensions).length or 1.0
+    keep_radius = RECON_KEEP_FACTOR * ref_diag
 
-    for o in heads:
-        o.matrix_world = Matrix.Translation(delta) @ o.matrix_world
-    print("fix_head_position: moved %d head obj(s) by (%.3f, %.3f, %.3f)"
-          % (len(heads), delta.x, delta.y, delta.z))
+    kept, removed = [], 0
+    for ob in list(objs):
+        if ob.type != "MESH" or ob.name not in Ms:
+            continue
+        rel = M_ref_inv @ Ms[ob.name]
+        rel = rel / rel[3, 3]
+        placed = (rel @ np.append(pre_c[ob.name], 1.0))[:3]
+        if float(np.linalg.norm(placed - ref_c)) <= keep_radius:
+            relM = Matrix([[float(rel[i][j]) for j in range(4)] for i in range(4)])
+            ob.matrix_world = relM @ ob.matrix_world
+            kept.append(ob)
+        else:
+            bpy.data.objects.remove(ob, do_unlink=True)
+            removed += 1
+    print("reconstruct: ref=%s  kept %d same-pass meshes, removed %d other-pass copies"
+          % (ref, len(kept), removed))
+    return kept
 
 
 def mesh_files(frame_dir):
-    files = sorted(glob.glob(os.path.join(frame_dir, "mesh_*.nr")), key=_natural_key)
-    return files
+    return sorted(glob.glob(os.path.join(frame_dir, "mesh_*.nr")), key=_natural_key)
 
 
 def summarize(objects):
@@ -298,23 +342,13 @@ def main():
     print("Importing %d .nr files from %s  (mode=%s)" % (len(files), FRAME_DIR, MODE))
     if MODE == "prevs":
         bpy.ops.import_mesh_prevs.nr(
-            directory=directory,
-            files=file_elems,
-            vertexLayoutTab="AUTO",
-            texturingTab="AUTO",
-            normalsTab="AUTO",
-        )
+            directory=directory, files=file_elems,
+            vertexLayoutTab="AUTO", texturingTab="AUTO", normalsTab="AUTO")
     elif MODE == "world":
         bpy.ops.import_mesh.nr(
-            directory=directory,
-            files=file_elems,
-            projTab="MANUAL",
-            scrWidth=WORLD_SCR_W,
-            scrHeight=WORLD_SCR_H,
-            fov=WORLD_FOV,
-            texturingTab="AUTO",
-            normalsTab="AUTO",
-        )
+            directory=directory, files=file_elems,
+            projTab="MANUAL", scrWidth=WORLD_SCR_W, scrHeight=WORLD_SCR_H,
+            fov=WORLD_FOV, texturingTab="AUTO", normalsTab="AUTO")
     else:
         raise RuntimeError("Unknown MODE %r (use 'prevs' or 'world')" % MODE)
 
@@ -328,17 +362,16 @@ def main():
                 c.objects.unlink(ob)
             coll.objects.link(ob)
 
-    # Stand the models upright (Z-up). The game's "up" axis varies, so detect it
-    # as the longest bounding-box dimension and rotate that axis onto +Z.
+    # Projection-free assembly: place each mesh correctly and drop pass duplicates.
+    if RECONSTRUCT and MODE == "prevs":
+        new_objs = reconstruct(new_objs, FRAME_DIR)
+
+    # Stand upright (Z-up).
     if STAND_UPRIGHT:
         rot = _upright_rotation(new_objs)
         if rot is not None:
             for ob in new_objs:
                 ob.matrix_world = rot @ ob.matrix_world
-
-    # Snap the skinned head group back onto the neck (must run after upright).
-    if FIX_HEAD and MODE == "prevs":
-        fix_head_position(new_objs)
 
     summarize(new_objs)
     print("Done in %.1fs -> collection '%s'" % (time.time() - t0, coll.name))
