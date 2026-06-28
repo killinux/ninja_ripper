@@ -68,11 +68,12 @@ RECON_KEEP_FACTOR = globals().get("RECON_KEEP_FACTOR", 2.5)  # keep meshes place
 FIX_MATERIALS = globals().get("FIX_MATERIALS", True)
 
 # Albedo the content/UV heuristics can't infer, keyed by PreVS vertex count ->
-# (texture-name-substring, uv-layer). The eyeball binds BOTH a sclera (light,
-# which the heuristic picks -> "white eyes") and the iris; the iris is the real
-# eye albedo and uses its own sphere-wrap uv_0. This pins it. {} for an unknown
-# model (then eyes fall back to the heuristic).
-ALBEDO_OVERRIDES = globals().get("ALBEDO_OVERRIDES", {458: ("A9F630", "uv_0")})
+# (texture-name-substring, uv-layer). The eyeball's full texture (30D730: sclera +
+# correctly-placed iris) is the right one and maps on its own uv_0; the heuristic
+# instead picked it onto the degenerate uv_7 ("white eyes"). (A9F630 is the
+# iris-only map and, stretched over the whole ball, looks like a solid blue
+# sphere.) {} for an unknown model (then eyes fall back to the heuristic).
+ALBEDO_OVERRIDES = globals().get("ALBEDO_OVERRIDES", {458: ("30D730", "uv_0")})
 
 # Game models are usually not Z-up. Rotate the longest bbox axis onto +Z so the
 # character stands upright. Geometry is unchanged, only the orientation.
