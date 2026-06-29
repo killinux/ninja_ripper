@@ -1,5 +1,7 @@
 # ninja_ripper → Blender
 
+> 中文说明见 [README.zh-CN.md](README.zh-CN.md)
+
 Import a **Ninja Ripper 2** capture frame (`.nr` meshes + `.dds` textures) into a
 running Blender, with geometry, UVs, split normals and textures all bound
 correctly.
